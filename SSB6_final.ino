@@ -5,6 +5,11 @@
  *   Using the Nokia library modified for OLED.
  */
 
+ // functions wanted.  Use menu or tap, double tap, long press of switch
+ //   tuning step change  10k 1k 100hz
+ //   band change         80 40 30 20 15 10 meters
+ //   mode change         CW, USB, LSB, WSPR stand alone
+
 #include <Arduino.h>
 #include <avr/interrupt.h>
 #include <OLED1306_Basic.h>
@@ -24,11 +29,13 @@
 #define CLK0_EN   1
 #define CLK1_EN   2
 #define CLK2_EN   4
-#define CLOCK_FREQ   2499969200LL   //2500000000LL
+#define CLOCK_FREQ  2500009000ULL   //2500000000LL  792 692
+//uint64_t CLOCK_FREQ = 2500009000ULL;
 
 #define CW 0       // modes
 #define USB 1
 #define LSB 2
+#define WSPR 3
 
   /* switch states */
 #define IDLE_ 0
@@ -39,14 +46,18 @@
 #define DTAP 5
 #define LONGP 6
 
+#define CW_PIN 2          // cw mode or wspr mode to unbalance the modulator
+#define PTT_PIN 3         // ssb transmit via fet
+#define KEY_PIN 4         // cw or wspr transmit via fet
+#define WSPR_OFFSET 1436  // wspr audio freq
 
 uint32_t freq;
-int stp = 100;
+int stp = 1000;
 uint32_t bfo;
 const int  bfo_divider = 88;
-int band = 1;                  // 40 meters
+int band = 0;
 int mode;
-const int bfo_freq[] = { 9004300, 9004300, 9000000 };
+const uint32_t bfo_freq[] = { 9004300, 9004300, 9000000, 9004300 };  // bfo per mode, all usb except LSB
 
 OLED1306 LCD;            // a modified version of LCD_BASIC by Rinky-Dink Electronics
 
@@ -56,7 +67,7 @@ extern unsigned char BigNumbers[];
 
 //  I2C buffers and indexes
 #define I2TBUFSIZE 128             // size power of 2. Size 128 can buffer a full row
-#define I2RBUFSIZE 16              // set to expected #of reads in row, power of 2
+#define I2RBUFSIZE 4               // set to expected #of reads in row, power of 2. Not doing reads this program.
 #define I2INT_ENABLED 1            // 0 for polling in loop or timer, 1 for TWI interrupts
 unsigned int i2buf[I2TBUFSIZE];   // writes
 uint8_t i2rbuf[I2RBUFSIZE];       // reads
@@ -73,7 +84,7 @@ struct BAND {
 
 // band stacking registers.  Dividers for high side vfo.
 struct BAND band_info[6] = {
-  { 3680000,56,LSB,7 },
+  { 3928000,56,LSB,7 },
   { 7185000,44,LSB,8 },
   {10110000,38,CW,9 },
   {14060000,32,CW,10 },
@@ -81,29 +92,61 @@ struct BAND band_info[6] = {
   {28500000,20,USB,12 }
   };
 
-int8_t sstate[1];    /* state of each switch */
+uint32_t wspr_freq[6] = { 3592600, 7038600, 10138700, 14095600, 21094600, 28124600 };
+
+int8_t sstate[1];    //state of each switch, only have one for this radio
+
+uint8_t min_,sec_,hour_;         // uptime and wspr timing
+uint8_t wspr_tx_enable;          // wspr tx active
+
+//      Download WSPRcode.exe from  http://physics.princeton.edu/pulsar/K1JT/WSPRcode.exe   and run it in a dos window 
+//      Type (for example):   WSPRcode "K1ABC FN33 37"    37 is 5 watts, 30 is 1 watt, 33 is 2 watts, 27 is 1/2 watt
+//      ( Use capital letters in your call and locator when typing in the message string.  No extra spaces )
+//      Using the editing features of the dos window, mark and copy the last group of numbers
+//      Paste into notepad and replace all 3 with "3,"  all 2 with "2," all 1 with "1," all 0 with "0,"
+//      Remove the comma on the end
+//  the current message is   "K1URC FN54 23"
+const char wspr_msg[] = { 
+ 3, 3, 2, 2, 2, 0, 0, 2, 1, 2, 0, 2, 1, 1, 1, 2, 2, 2, 3, 0, 0, 1, 0, 1, 1, 3, 3, 2, 2, 0,
+ 2, 2, 0, 0, 3, 2, 0, 3, 0, 1, 2, 0, 2, 0, 0, 2, 3, 0, 1, 3, 2, 0, 1, 1, 2, 1, 0, 2, 0, 3,
+ 3, 2, 3, 2, 2, 2, 2, 1, 3, 2, 3, 0, 3, 0, 3, 0, 3, 2, 0, 3, 2, 0, 3, 0, 3, 1, 0, 2, 0, 1,
+ 1, 2, 1, 2, 3, 0, 2, 2, 3, 2, 2, 0, 2, 2, 1, 0, 2, 1, 2, 0, 3, 3, 1, 2, 3, 1, 2, 2, 3, 1,
+ 2, 1, 2, 0, 0, 1, 1, 3, 2, 2, 2, 2, 0, 1, 0, 1, 2, 0, 3, 1, 0, 2, 0, 0, 2, 2, 0, 1, 3, 0,
+ 1, 2, 3, 1, 0, 2, 2, 1, 3, 0, 2, 2
+ };
+
 
 
 void setup(void){
 int i;
   
   Serial.begin(38400);                  // for debug
+  i2init();
 
+  pinMode(13,OUTPUT);
   // encoder
   pinMode(A0,INPUT);
   pinMode(A1,INPUT);
   pinMode(A2,INPUT);
+  pinMode(CW_PIN,OUTPUT);        // mode, controls qsk delay and balance of modulator
+  pinMode(PTT_PIN,OUTPUT);
+  pinMode(KEY_PIN,OUTPUT);
+
+  digitalWrite(PTT_PIN,LOW);     // FET's to switch 8 volt pullup signals
+  digitalWrite(KEY_PIN,LOW);
 
   // generate an interrupt for the I2C processing, timer 0 compare.
-  OCR0A = 0xAF;
-  TIMSK0 |= _BV(OCIE0A);
+  //OCR0A = 0xAF;
+  //TIMSK0 |= _BV(OCIE0A);
 
   LCD.InitLCD();                        // using a modified Nokia library for the OLED
   LCD.setFont(SmallFont);
   LCD.clrScr();
   LCD.print("SSB6.1 WSPR",0,ROW0);
+  i2flush();
   delay(2000);
-  LCD.clrRow(0);
+ // LCD.clrRow(0);   // ? clear to end from current position 
+  LCD.clrScr();
 
   // band select pins
   for( i = 0; i < 6; ++i ){
@@ -129,25 +172,28 @@ int i;
     i2cd(SI5351,48+8*i,0);
     i2cd(SI5351,49+8*i,0);
   }
- 
-  freq_display();
+
   digitalWrite(band_info[band].pin, HIGH);    // select front end filter for default band
-//  digitalWrite(CW_PIN,(mode == CW)?HIGH:LOW);
+  digitalWrite(CW_PIN,(mode == CW || mode == WSPR)?HIGH:LOW);
 
   si_pll_x(PLLB,bfo,bfo_divider,0);  
   si_load_divider(bfo_divider,2,0,1);
   si_pll_x(PLLA,freq + bfo ,band_info[band].divider,0);
   si_load_divider(band_info[band].divider,0,1,1);      // load divider and reset pll's
+  delay(200);                                          // sometimes fails to init
+  si_load_divider(band_info[band].divider,0,1,1);      // load divider and reset pll's
+  
   
   i2cd(SI5351,3,0xff ^ (CLK0_EN + CLK2_EN) );   // turn on clocks vfo and bfo
   //  i2cd(SI5351,3,0xff ^ (CLK0_EN + CLK1_EN + CLK2_EN));   // testing only all on, remove tx PWR
 
+  op_display();
 }
 
 // timer polling.  about 1000 cps or 8k baud screen writes
-ISR(TIMER0_COMPA_vect){
-   i2poll();
-}
+//ISR(TIMER0_COMPA_vect){
+//   i2poll();
+//}
 
 // TWI interrupt version
 // if twi interrupts enabled, then need a handler
@@ -155,39 +201,210 @@ ISR(TIMER0_COMPA_vect){
 ISR(TWI_vect){
   i2poll();
   if( gi2state == 0 ) i2poll();   // needed to get out of state zero, else double ints
-// // ++ints;
+ // ++ints;
 }
 
 
 void loop(void){
 int8_t t;
 
+    noInterrupts();
+    i2poll();
+    interrupts();
     t = encoder();
     if( t ) freq_change(t);
 
-    switches();
+    t = switches();
     // act on switch sstate[0]
+    if( t > DONE){
+       switch( t ){
+          case TAP:
+             stp /= 10;
+             if( stp == 1 ) stp = 10000; 
+          break;
+          case DTAP:   mode_change();  break;
+          case LONGP:  band_change();  break;
+       }
+       op_display();
+       sstate[0] = DONE;
+    }
 
+    keep_time();
+    if( wspr_tx_enable ) wspr_tx( millis() );
+    if( mode == WSPR ) wspr_frame();
+
+}
+
+//   ***************   WSPR standalone tx
+void wspr_frame(){      // fixed 20 minute frame
+
+   if( min_ == 20 && wspr_tx_enable == 0 ){
+       wspr_tx_enable = 1;
+       min_ = 0;
+   }   
+}
+
+void wspr_tx( unsigned long t ){
+static int i;
+static unsigned long timer;
+static uint8_t mod;
+   
+   if( (t - timer) < 683 ) return;   // baud time is 682.66666666 ms
+   timer = t;
+   if( ++mod == 3 ) mod = 0, ++timer;    // delay 683, 683, 682, etc.
+
+   if( i == 162 ){
+      tx_off();
+      i = 0;                 // setup for next time to begin at zero index
+      wspr_tx_enable = 0;    // flag done
+      return;
+   }
+
+   // set the frequency, modulate the bfo into the passband
+   si_pll_x(PLLB,bfo+WSPR_OFFSET,bfo_divider,146*wspr_msg[i]);  
+   if( i == 0 ) tx_on();
+   ++i; 
+}
+
+
+void tx_on(){
+
+  if( mode == WSPR ) digitalWrite(KEY_PIN,HIGH);
+  else digitalWrite(PTT_PIN,HIGH);
+}
+
+void tx_off(){
+  
+  if( mode == WSPR ){
+    digitalWrite(KEY_PIN,LOW);
+    si_pll_x(PLLB,bfo,bfo_divider,0);  
+  }
+  else digitalWrite(PTT_PIN,LOW);
+
+}
+
+
+
+// print out the operating parameters
+void op_display(){
+const uint8_t b[6] = {80,40,30,20,15,10};
+
+  LCD.print("Step",0,ROW3);  LCD.printNumI(stp,35,ROW3,5,' ');
+  LCD.print("Mode",0,ROW5);
+  switch(mode){
+      case CW:  LCD.print("CW  ",40,ROW5);  break;
+      case USB: LCD.print("USB ",40,ROW5);  break;
+      case LSB: LCD.print("LSB ",40,ROW5);  break;
+      case WSPR: LCD.print("WSPR",40,ROW5); break;
+  }
+  LCD.print("Band",0,ROW7);
+  LCD.printNumI(b[band],40,ROW7);
+  
+  LCD.print("Tap ",RIGHT,ROW3);
+  LCD.print("DTap",RIGHT,ROW5);
+  LCD.print("Long",RIGHT,ROW7);
+  freq_display();
 }
 
 void freq_change(int8_t t ){
 
+//uint32_t temp;                            // finding correct value of the 25mhz crystal
+//  CLOCK_FREQ = CLOCK_FREQ + stp*(int)t;
+//  temp = CLOCK_FREQ/100;
+//  Serial.println(temp);
+  
   freq = freq + stp*(int)t;
   si_pll_x(PLLA,freq + bfo ,band_info[band].divider,0);
   freq_display();
 }
 
 void freq_display(){
+int rem;
   
    LCD.setFont(MediumNumbers);
-   LCD.printNumI(freq,0,ROW0,8,'/');       // '/' is a leading space with this font table
-   LCD.gotoRowCol(0,108);
+   LCD.printNumI(freq/1000,0,ROW0,5,'/');       // '/' is a leading space with this font table
    LCD.setFont(SmallFont);
-   if( mode == CW ) LCD.puts(" CW");
-   if( mode == LSB ) LCD.puts("LSB");
-   if( mode == USB ) LCD.puts("USB");
+   rem = freq % 1000;
+   LCD.printNumI(rem,64,ROW0,3,'0');   
+ //  LCD.gotoRowCol(0,108);
+ //  if( mode == CW ) LCD.puts(" CW");
+ //  if( mode == LSB ) LCD.puts("LSB");
+ //  if( mode == USB || mode == WSPR) LCD.puts("USB");
 }
 
+void time_display(){
+
+   LCD.setFont(SmallFont);
+   LCD.printNumI(min_,98,ROW1,2,' ');
+   LCD.putch(':');
+   LCD.printNumI(sec_,116,ROW1,2,'0');
+   LCD.printNumI(hour_,RIGHT,ROW0);
+}
+
+void keep_time(){
+static uint32_t tm;
+static uint16_t tm_adj;
+
+   if( millis() - tm < 1000 ) return;
+   tm += 1000;
+
+   if( ++sec_ >= 60 ){
+      sec_ -= 60;
+      if( ++min_ == 60 ) min_ = 0, ++hour_ ;
+   }
+
+   // 16 mhz clock error ?
+   if( ++tm_adj >=  30 ){      // 1 millisecond adjustment in so many seconds to stay on time
+      ++tm;                    // --tm running slow,  ++tm running fast.
+      tm_adj = 0;
+   }
+
+   time_display();
+   
+}
+
+// save current band params and load new vfo and dividers
+// wspr freq not saved
+void band_change(){
+
+  digitalWrite(band_info[band].pin,LOW);
+  // save current
+  if( mode != WSPR ) band_info[band].freq = freq;
+  band_info[band].mode = mode;
+  
+  if( ++band > 5 ) band = 0;
+  
+  digitalWrite(band_info[band].pin,HIGH);
+  mode_band_change();
+
+}
+
+void mode_change(){
+
+   if( mode != WSPR ) band_info[band].freq = freq;
+   if( ++mode > WSPR ) mode = 0;
+   band_info[band].mode = mode;
+   mode_band_change();
+}
+
+// load up the si5351
+void mode_band_change(){
+
+  // load the working freq values
+  mode = band_info[band].mode;
+  if( mode != WSPR ) freq = band_info[band].freq;
+  else freq = wspr_freq[band];
+
+  bfo = bfo_freq[mode];
+
+  si_pll_x(PLLB,bfo,bfo_divider,0);  
+  si_load_divider(bfo_divider,2,0,1);
+  si_pll_x(PLLA,freq + bfo ,band_info[band].divider,0);
+  si_load_divider(band_info[band].divider,0,1,1);      // load divider and reset pll's  
+
+  digitalWrite(CW_PIN,(mode == CW || mode == WSPR)?HIGH:LOW);
+
+}
 
 int8_t encoder(){   /* read encoder, return 1, 0, or -1 */
   
@@ -204,24 +421,24 @@ int8_t b;
    last = new_;
    if( b != dir ){
       dir = b;
-      return 0;      /* require two clicks in the same direction */
+      return 0;      /* require two in the same direction serves as debounce */
    }
-   mod = (mod + 1) & 3;      /* divide clicks by 4 */
-   if( mod != 3 ) return 0;
+   mod = (mod + 1) & 3;       /* divide by 4 for encoder with detents */
+   if( mod != 2 ) return 0;
 
-   if( dir == 2 ) return -1;   /* swap return values if it works backwards */
-   else return 1;
+   if( dir == 2 ) return 1;   /* swap return values if it works backwards */
+   else return -1;
 }
 
       /* run the switch state machine, generic code for multiple switches even though have only one here */
-void switches(){
+int8_t switches(){
 static uint8_t press_, nopress;
 static uint32_t tm;
 int  i,j;
 int8_t sw;
 int8_t s;
 
-   if( tm == millis() ) return;      // run once per millisecond
+   if( tm == millis() ) return 0;      // run once per millisecond
    tm = millis();
    
    /* get the switch readings, low active but invert bits */
@@ -248,7 +465,8 @@ int8_t s;
       sstate[i] = s; 
       j <<= 1;
    }
-
+   
+   return sstate[0];      // only one switch implemented so can return its value
 }
 
 
@@ -278,12 +496,14 @@ uint8_t  next;
   // check for buffer full
   next = (i2in + 1) & (I2TBUFSIZE-1);
   if( next == i2out ){
+     digitalWrite(13,HIGH);         // see if hangs here
      while( next == i2out ){
          noInterrupts();
          i2poll();        // wait for i2out to move
          interrupts();
      }
     //++waits;
+    digitalWrite(13,LOW);
   }
   
   i2buf[i2in++] = data;
@@ -424,6 +644,7 @@ static uint8_t first_read;
    else return state;
 }
 
+/******   SI5351  functions   ******/
 
 void i2cd( unsigned char addr, unsigned char reg, unsigned char dat ){
   // direct register writes.  A possible speed up could be realized if one were
@@ -434,9 +655,6 @@ void i2cd( unsigned char addr, unsigned char reg, unsigned char dat ){
    i2send(dat);
    i2stop();
 }
-
-
-/******   SI5351  functions   ******/
 
 void  si_pll_x(unsigned char pll, uint32_t freq, uint32_t out_divider, uint32_t fraction ){
  uint64_t a,b,c;
